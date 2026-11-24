@@ -58,7 +58,25 @@
       border-radius: 12px;
       padding: 12px 14px;
       width: 100%;
+      max-width: 100%;
+      min-width: 0;
+      box-sizing: border-box;
       transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+
+    input[type="date"] {
+      display: block;
+      width: 100%;
+      max-width: 100%;
+      min-width: 0;
+      min-height: 46px;
+      -webkit-appearance: none;
+      appearance: none;
+    }
+
+    .input-group {
+      min-width: 0;
+      max-width: 100%;
     }
 
     input:focus, select:focus, textarea:focus {
@@ -3015,7 +3033,23 @@
 
     /* 6H. EXPORT / BACKUP / DATA MANAGEMENT VIEW */
     function renderDataView() {
+      const baseUrl = window.location.origin + window.location.pathname;
       return `
+        <div class="card" style="border-color:rgba(56, 189, 248, 0.4);">
+          <div style="font-size:12px; font-weight:700; color:var(--accent); text-transform:uppercase;">iOS Health & Apple Watch Bridge</div>
+          <h2 style="margin:4px 0 6px 0; font-size:20px;">Apple Shortcuts Integration</h2>
+          <p style="margin:0 0 12px 0; font-size:13.5px; color:var(--text-secondary);">
+            Use an Apple Shortcut to read your latest run (duration & distance) and body weight/body fat from <strong>Apple Health</strong> and send them straight into your current week.
+          </p>
+          <div style="background:rgba(15, 23, 42, 0.7); border:1px solid var(--border); border-radius:12px; padding:10px 12px; font-size:12px; color:var(--text-secondary); word-break:break-all; margin-bottom:10px;">
+            <div style="font-weight:700; color:var(--text-primary); margin-bottom:4px;">Your Shortcut URL Template:</div>
+            <code id="shortcutUrlTemplate">${escapeHtml(baseUrl)}?import=1&amp;weight=[Weight]&amp;bf=[BodyFat]&amp;dur=[Duration]&amp;dist=[Distance]</code>
+          </div>
+          <button type="button" class="btn-secondary" id="copyShortcutUrlBtn" style="width:100%; color:var(--accent);">
+            Copy URL Template for Apple Shortcuts
+          </button>
+        </div>
+
         <div class="card">
           <div style="font-size:12px; font-weight:700; color:var(--accent); text-transform:uppercase;">Google Sheets & iPhone Backup</div>
           <h2 style="margin:4px 0 6px 0; font-size:20px;">Export & Backup Your Data</h2>
@@ -3065,6 +3099,21 @@
     }
 
     function attachDataEvents() {
+      const copyUrlBtn = document.getElementById("copyShortcutUrlBtn");
+      if (copyUrlBtn) {
+        copyUrlBtn.addEventListener("click", () => {
+          const baseUrl = window.location.origin + window.location.pathname;
+          const template = `${baseUrl}?import=1&weight=&bf=&dur=&dist=`;
+          const ta = document.createElement("textarea");
+          ta.value = template;
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand("copy");
+          document.body.removeChild(ta);
+          showToast("Base URL copied!");
+        });
+      }
+
       document.getElementById("exportLiftsCsvBtn").addEventListener("click", exportLiftsCSV);
       document.getElementById("exportRunsCsvBtn").addEventListener("click", exportRunsCSV);
       document.getElementById("exportBodyCsvBtn").addEventListener("click", exportBodyCSV);
@@ -3251,6 +3300,114 @@
       if (state.view === "body") drawBodyChart();
     });
 
+    /*************************************************************************
+     * 8. APPLE SHORTCUT / URL PARAMETER HEALTH IMPORTER
+     *************************************************************************/
+    function handleIncomingHealthImport() {
+      try {
+        const params = new URLSearchParams(window.location.search);
+        if (!params.has("import") && !params.has("weight") && !params.has("dur") && !params.has("dist")) {
+          return;
+        }
+
+        const cleanNum = (raw) => {
+          if (!raw) return "";
+          const match = String(raw).replace(/,/g, "").match(/-?\d+(\.\d+)?/);
+          return match ? match[0] : "";
+        };
+
+        const weight = cleanNum(params.get("weight"));
+        const bf = cleanNum(params.get("bf"));
+        const dur = cleanNum(params.get("dur"));
+        const dist = cleanNum(params.get("dist"));
+        const dateParam = params.get("date") || new Date().toISOString().slice(0, 10);
+        const dayParam = (params.get("day") || "").toLowerCase();
+
+        const w = state.currentWeek || 1;
+        let importedParts = [];
+        let targetView = null;
+
+        // 1. Import Body Weight / Body Fat into current week's Body Log
+        if (weight || bf) {
+          if (!state.body[`${w}`]) {
+            state.body[`${w}`] = {
+              date: dateParam,
+              weight: "",
+              bodyFat: "",
+              waist: "",
+              chest: "",
+              arms: "",
+              thighs: "",
+              notes: ""
+            };
+          }
+          if (weight) {
+            state.body[`${w}`].weight = weight;
+            importedParts.push(`${weight} lbs`);
+          }
+          if (bf) {
+            state.body[`${w}`].bodyFat = bf;
+            importedParts.push(`${bf}% BF`);
+          }
+          if (dateParam) state.body[`${w}`].date = dateParam;
+          targetView = "body";
+        }
+
+        // 2. Import Run Duration / Distance into matching run day (Tue, Thu, or Sat)
+        if (dur || dist) {
+          let runDayId = ["tue", "thu", "sat"].includes(dayParam) ? dayParam : "";
+          if (!runDayId) {
+            const dow = new Date().getDay(); // 0=Sun, 2=Tue, 4=Thu, 6=Sat
+            if (dow === 2 || dow === 3) runDayId = "tue";
+            else if (dow === 4 || dow === 5) runDayId = "thu";
+            else runDayId = "sat";
+          }
+
+          const key = `${w}_${runDayId}`;
+          if (!state.runs[key]) {
+            state.runs[key] = {
+              date: dateParam,
+              duration: "",
+              distance: "",
+              effort: 5,
+              notes: "",
+              completed: false
+            };
+          }
+          if (dur) {
+            state.runs[key].duration = dur;
+            importedParts.push(`${dur} min run`);
+          }
+          if (dist) {
+            state.runs[key].distance = dist;
+            importedParts.push(`${dist} mi`);
+          }
+          state.runs[key].date = dateParam;
+          state.runs[key].completed = true;
+          state.selectedDayId = runDayId;
+          targetView = "run";
+        }
+
+        // Clean URL query params so refreshing doesn't re-trigger import
+        if (window.history && window.history.replaceState) {
+          window.history.replaceState({}, document.title, window.location.pathname);
+        }
+
+        if (importedParts.length > 0) {
+          if (targetView === "run") {
+            state.activeTab = "calendar";
+            state.view = "run";
+          } else if (targetView === "body") {
+            state.activeTab = "body";
+            state.view = "body";
+          }
+          saveState(`Imported from Health: ${importedParts.join(", ")}`);
+        }
+      } catch (err) {
+        console.error("Health import error:", err);
+      }
+    }
+
     window.onload = function () {
       document.getElementById("prevWeekBtn").addEventListener("click", () => setWeek(state.currentWeek - 1));
       document.getElementById("nextWeekBtn").addEventListener("click", () => setWeek(state.currentWeek + 1));
@@ -3259,6 +3416,7 @@
         btn.addEventListener("click", () => switchTab(btn.getAttribute("data-tab")));
       });
 
+      handleIncomingHealthImport();
       render();
     };
   </script>
