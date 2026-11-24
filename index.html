@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-  <meta name="apple-mobile-web-app-title" content="12W Strength" />
-  <link rel="apple-touch-icon" sizes="180x180" href="icon.png?v=2">
+  <meta name="apple-mobile-web-app-title" content="Workout Tracker" />
+  <link rel="apple-touch-icon" sizes="180x180" href="icon.png?v=2" />
   <meta name="theme-color" content="#0f172a" />
   <title>12-Week Strength & Run Tracker</title>
   <style>
@@ -930,10 +930,21 @@
       return {
         currentWeek: 1,
         activeTab: "calendar", // calendar | progress | body | data
-        view: "calendar",      // calendar | day | lift | run | recovery
+        view: "calendar",      // calendar | baseline | day | lift | run | recovery
         selectedDayId: null,
         selectedExerciseId: null,
         phaseExpanded: false,
+        baselineDismissed: false,
+        startingBaseline: {
+          date: new Date().toISOString().slice(0, 10),
+          weight: "",
+          bodyFat: "",
+          waist: "",
+          chest: "",
+          arms: "",
+          thighs: "",
+          notes: ""
+        },
         lifts: {},             // key: `${week}_${exerciseId}` -> { bwMode, sets: [{ weight, reps, done }], notes }
         runs: {},              // key: `${week}_${dayId}` -> { date, duration, distance, effort, notes, completed }
         recovery: {},          // key: `${week}` -> { checks: {}, soreness: 2, notes: "" }
@@ -943,7 +954,26 @@
       };
     }
 
+    function hasStartingBaseline() {
+      const b = state.startingBaseline;
+      if (!b) return false;
+      return ["weight", "bodyFat", "waist", "chest", "arms", "thighs"].some(
+        k => b[k] !== "" && b[k] !== null && b[k] !== undefined
+      );
+    }
+
+    function getBaselineMetrics() {
+      if (hasStartingBaseline()) {
+        return { label: "Day 1 Start", data: state.startingBaseline };
+      }
+      return { label: "Week 1", data: state.body["1"] || {} };
+    }
+
     let state = loadState();
+    // Auto-open Starting Measurements screen on first launch at Week 1 if not yet recorded or skipped
+    if (state.currentWeek === 1 && !hasStartingBaseline() && !state.baselineDismissed && state.view === "calendar") {
+      state.view = "baseline";
+    }
 
     function loadState() {
       try {
@@ -957,30 +987,51 @@
       }
     }
 
-    function saveState(showToastMsg = null) {
+    function saveState(toastMsg = null) {
       try {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-        if (showToastMsg) showToast(showToastMsg);
+        if (toastMsg) showToast(toastMsg);
       } catch (e) {
-        console.error("Save error:", e);
-        showToast("Storage full! Export backup.");
+        console.error("Failed to save state:", e);
+        showToast("Storage warning: Export JSON backup");
       }
     }
 
-    let toastTimer = null;
     function showToast(msg) {
       const el = document.getElementById("toast");
       el.textContent = msg;
       el.classList.add("show");
-      clearTimeout(toastTimer);
-      toastTimer = setTimeout(() => el.classList.remove("show"), 2000);
+      clearTimeout(window.__toastTimer);
+      window.__toastTimer = setTimeout(() => el.classList.remove("show"), 2000);
+    }
+
+    function showConfirmModal(title, message, onConfirm) {
+      const modal = document.getElementById("confirmModal");
+      document.getElementById("modalTitle").textContent = title;
+      document.getElementById("modalMessage").textContent = message;
+      modal.classList.remove("hidden");
+
+      const cancelBtn = document.getElementById("modalCancelBtn");
+      const confirmBtn = document.getElementById("modalConfirmBtn");
+
+      const cleanup = () => {
+        modal.classList.add("hidden");
+        cancelBtn.onclick = null;
+        confirmBtn.onclick = null;
+      };
+
+      cancelBtn.onclick = cleanup;
+      confirmBtn.onclick = () => {
+        cleanup();
+        onConfirm();
+      };
     }
 
     /*************************************************************************
-     * 3. HELPER & CALCULATION ENGINE (Volume, e1RM, Auto Overload)
+     * 3. PROGRESS, VOLUME, e1RM, & OVERLOAD CALCULATION ENGINE
      *************************************************************************/
-    function getPhaseForWeek(week) {
-      return PROGRAM.phases.find(p => p.weeks.includes(week)) || PROGRAM.phases[0];
+    function getPhaseForWeek(weekNum) {
+      return PROGRAM.phases.find(p => p.weeks.includes(weekNum)) || PROGRAM.phases[0];
     }
 
     function getDayById(dayId) {
@@ -990,204 +1041,190 @@
     function getExerciseById(exId) {
       for (const day of PROGRAM.days) {
         if (day.exercises) {
-          const found = day.exercises.find(e => e.id === exId);
-          if (found) return { exercise: found, day };
+          const ex = day.exercises.find(e => e.id === exId);
+          if (ex) return { exercise: ex, day };
         }
       }
       return null;
     }
 
-    function getAllExercises() {
-      const list = [];
-      PROGRAM.days.forEach(d => {
-        if (d.exercises) {
-          d.exercises.forEach(ex => list.push({ ...ex, dayId: d.id, dayName: d.dayName }));
-        }
-      });
-      return list;
+    function getLiftRecord(week, exercise) {
+      const key = `${week}_${exercise.id}`;
+      const existing = state.lifts[key];
+      const sets = [];
+      for (let i = 0; i < exercise.sets; i++) {
+        const s = existing && existing.sets && existing.sets[i] ? existing.sets[i] : {};
+        sets.push({
+          weight: s.weight !== undefined ? s.weight : "",
+          reps: s.reps !== undefined ? s.reps : "",
+          done: Boolean(s.done)
+        });
+      }
+      return {
+        bwMode: (existing && existing.bwMode) || "bw",
+        sets,
+        notes: (existing && existing.notes) || ""
+      };
     }
 
-    function getLiftRecord(week, ex) {
-      const key = `${week}_${ex.id}`;
-      if (!state.lifts[key]) {
-        const sets = [];
-        for (let i = 0; i < ex.sets; i++) {
-          sets.push({ weight: "", reps: "", done: false });
-        }
-        return {
-          bwMode: ex.id === "wed_9" ? "assisted" : "bw", // bw | weighted | assisted
-          sets,
-          notes: ""
-        };
-      }
-      const rec = state.lifts[key];
-      // Ensure set array matches exercise set count
-      while (rec.sets.length < ex.sets) {
-        rec.sets.push({ weight: "", reps: "", done: false });
-      }
-      return rec;
-    }
-
-    function updateLiftRecord(week, ex, updater, toastMsg = null) {
-      const key = `${week}_${ex.id}`;
-      const rec = getLiftRecord(week, ex);
-      updater(rec);
-      state.lifts[key] = rec;
+    function updateLiftRecord(week, exercise, updater, toastMsg = null) {
+      const key = `${week}_${exercise.id}`;
+      const record = getLiftRecord(week, exercise);
+      updater(record);
+      state.lifts[key] = record;
       saveState(toastMsg);
     }
 
-    function getLastSessionLift(week, ex) {
-      for (let w = week - 1; w >= 1; w--) {
-        const key = `${w}_${ex.id}`;
-        const rec = state.lifts[key];
-        if (rec && rec.sets && rec.sets.some(s => s.weight !== "" || s.reps !== "" || s.done)) {
+    function getLastSessionLift(currentWeek, exercise) {
+      for (let w = currentWeek - 1; w >= 1; w--) {
+        const rec = getLiftRecord(w, exercise);
+        const hasData = rec.sets.some(s => (s.weight !== "" && s.weight !== null) || (s.reps !== "" && s.reps !== null));
+        if (hasData) {
           return { week: w, record: rec };
         }
       }
       return null;
     }
 
-    function calculateExerciseMetrics(ex, rec) {
+    // Epley Formula: Weight * (1 + Reps / 30)
+    function computeE1RM(weight, reps) {
+      const w = parseFloat(weight);
+      const r = parseFloat(reps);
+      if (!w || !r || w <= 0 || r <= 0) return 0;
+      if (r === 1) return Math.round(w * 10) / 10;
+      return Math.round(w * (1 + r / 30) * 10) / 10;
+    }
+
+    function calculateExerciseMetrics(exercise, record) {
       let volume = 0;
       let totalReps = 0;
       let bestE1RM = 0;
-      let topWeight = 0;
       let completedSets = 0;
 
-      rec.sets.forEach(s => {
+      record.sets.forEach(s => {
         const w = parseFloat(s.weight) || 0;
         const r = parseFloat(s.reps) || 0;
-        if (s.done || r > 0 || w > 0) completedSets++;
+        if (s.done || w > 0 || r > 0) completedSets++;
 
-        if (ex.inputMode === "weighted") {
+        if (exercise.inputMode === "weighted") {
           volume += w * r;
           totalReps += r;
-          if (w > topWeight) topWeight = w;
-          if (w > 0 && r > 0) {
-            const e1rm = r === 1 ? w : w * (1 + r / 30);
-            if (e1rm > bestE1RM) bestE1RM = e1rm;
-          }
-        } else if (ex.inputMode === "bodyweight") {
+          const e1rm = computeE1RM(w, r);
+          if (e1rm > bestE1RM) bestE1RM = e1rm;
+        } else if (exercise.inputMode === "bodyweight") {
           totalReps += r;
-          if (rec.bwMode === "weighted" && w > 0) {
+          if (record.bwMode === "weighted" && w > 0) {
             volume += w * r;
-            if (w > topWeight) topWeight = w;
           }
-        } else if (ex.inputMode === "timed") {
-          totalReps += w; // duration stored in weight field for timed exercises
+        } else if (exercise.inputMode === "timed") {
+          // For timed finishers/plank, weight field stores duration (min or sec)
+          totalReps += w;
         }
       });
 
       return {
         volume: Math.round(volume),
         totalReps,
-        bestE1RM: Math.round(bestE1RM * 10) / 10,
-        topWeight,
+        bestE1RM,
         completedSets
       };
     }
 
-    /**
-     * Auto Overload Alert Rule (from Progress Guide):
-     * "when all sets hit the top of the rep range, add 2.5–5% load."
-     */
-    function checkOverloadReady(week, ex) {
-      if (!ex.maxReps) return null;
+    // Check if all working sets hit the top of the target rep range (Progressive Overload Rule)
+    function checkOverloadReady(week, exercise) {
+      if (!exercise.maxReps) return null;
       const phase = getPhaseForWeek(week);
-      // Determine working set count (on deload weeks, users may reduce sets by 30-50%)
-      const requiredSets = phase.isDeload ? Math.max(1, Math.ceil(ex.sets * 0.6)) : ex.sets;
+      if (phase.isDeload) return null;
 
-      const evaluateRecord = (rec, sourceWeek) => {
-        if (!rec || !rec.sets) return null;
-        let setsAtCeiling = 0;
-        let maxW = 0;
-        rec.sets.forEach(s => {
-          const r = parseFloat(s.reps) || 0;
-          const w = parseFloat(s.weight) || 0;
-          if (r >= ex.maxReps) setsAtCeiling++;
-          if (w > maxW) maxW = w;
-        });
+      const rec = getLiftRecord(week, exercise);
+      // On deload weeks or optional sets, check working sets
+      const workingSets = rec.sets;
+      if (workingSets.length === 0) return null;
 
-        if (setsAtCeiling >= requiredSets) {
-          let suggestedWeight = null;
-          if (ex.inputMode === "weighted" && maxW > 0) {
-            const rawNext = maxW * 1.035; // ~3.5% midpoint of 2.5-5%
-            const increment = maxW >= 100 ? 5 : 2.5;
-            suggestedWeight = Math.ceil(rawNext / increment) * increment;
-            if (suggestedWeight <= maxW) suggestedWeight = maxW + increment;
-          }
-          return {
-            triggered: true,
-            sourceWeek,
-            currentWeight: maxW,
-            suggestedWeight
-          };
+      const allHitTop = workingSets.every(s => {
+        const r = parseFloat(s.reps);
+        if (!r || r < exercise.maxReps) return false;
+        if (exercise.inputMode === "weighted") {
+          return (parseFloat(s.weight) || 0) > 0;
         }
-        return null;
-      };
+        return true;
+      });
 
-      // Check current week first, then previous week
-      const currRec = state.lifts[`${week}_${ex.id}`];
-      const currRes = evaluateRecord(currRec, week);
-      if (currRes) return currRes;
+      if (!allHitTop) return null;
 
-      if (week > 1) {
-        const prevRec = state.lifts[`${week - 1}_${ex.id}`];
-        const prevRes = evaluateRecord(prevRec, week - 1);
-        if (prevRes) return prevRes;
+      // Compute suggested +2.5–5% load rounded to nearest 2.5 lbs
+      const weights = workingSets.map(s => parseFloat(s.weight) || 0).filter(w => w > 0);
+      if (weights.length > 0) {
+        const maxW = Math.max(...weights);
+        const rawNext = maxW * 1.035; // midpoint of 2.5% - 5%
+        const roundedNext = Math.max(maxW + 2.5, Math.round(rawNext / 2.5) * 2.5);
+        return {
+          ready: true,
+          currentWeight: maxW,
+          suggestedWeight: roundedNext
+        };
       }
-      return null;
+
+      return { ready: true, currentWeight: 0, suggestedWeight: null };
     }
 
-    function getDayCompletion(week, day) {
+    function getDayCompletionStats(week, day) {
       if (day.type === "lift") {
-        const total = day.exercises.length;
-        let doneCount = 0;
+        let doneExercises = 0;
         day.exercises.forEach(ex => {
-          const rec = state.lifts[`${week}_${ex.id}`];
-          if (rec && rec.sets.some(s => s.done || (s.reps !== "" && Number(s.reps) > 0) || (s.weight !== "" && Number(s.weight) > 0))) {
-            doneCount++;
-          }
+          const rec = getLiftRecord(week, ex);
+          const hasAny = rec.sets.some(s => s.done || s.weight !== "" || s.reps !== "");
+          if (hasAny) doneExercises++;
         });
-        return { done: doneCount, total, isComplete: doneCount === total && total > 0, hasAny: doneCount > 0 };
+        return {
+          completed: doneExercises,
+          total: day.exercises.length,
+          isComplete: doneExercises === day.exercises.length,
+          isStarted: doneExercises > 0
+        };
       } else if (day.type === "run" || day.type === "opt") {
         const run = state.runs[`${week}_${day.id}`];
-        const logged = !!(run && (run.completed || run.duration || run.distance));
-        return { done: logged ? 1 : 0, total: 1, isComplete: logged, hasAny: logged };
+        const isDone = Boolean(run && (run.completed || run.duration || run.distance));
+        return { completed: isDone ? 1 : 0, total: 1, isComplete: isDone, isStarted: isDone };
       } else {
         const rec = state.recovery[`${week}`];
-        const logged = !!(rec && (Object.values(rec.checks || {}).some(Boolean) || (rec.notes && rec.notes.trim().length > 0)));
-        return { done: logged ? 1 : 0, total: 1, isComplete: logged, hasAny: logged };
+        const checkedCount = rec && rec.checks ? Object.values(rec.checks).filter(Boolean).length : 0;
+        return {
+          completed: checkedCount,
+          total: RECOVERY_ITEMS.length,
+          isComplete: checkedCount === RECOVERY_ITEMS.length,
+          isStarted: checkedCount > 0 || Boolean(rec && rec.notes)
+        };
       }
     }
 
     function getWeekCompletionStatus(week) {
-      let any = false;
+      const coreDays = PROGRAM.days.filter(d => d.id !== "sat");
       let completedDays = 0;
-      PROGRAM.days.forEach(d => {
-        const c = getDayCompletion(week, d);
-        if (c.hasAny) any = true;
-        if (c.isComplete) completedDays++;
+      let startedDays = 0;
+      coreDays.forEach(d => {
+        const st = getDayCompletionStats(week, d);
+        if (st.isComplete) completedDays++;
+        if (st.isStarted) startedDays++;
       });
-      if (completedDays >= 6) return "complete";
-      if (any) return "partial";
-      return "none";
+      if (completedDays >= 5) return "complete";
+      if (startedDays > 0) return "partial";
+      return "empty";
     }
 
     /*************************************************************************
-     * 4. BUILT-IN REST & INTERVAL TIMER ENGINE (Web Audio API Beep)
+     * 4. BUILT-IN REST & FINISHER INTERVAL TIMER (WITH WEB AUDIO BEEP)
      *************************************************************************/
-    let timerInterval = null;
     let timerState = {
       running: false,
       mode: "countdown", // countdown | interval
       secondsLeft: 90,
       totalSeconds: 90,
-      intervalRound: 1,
-      intervalTotalRounds: 5,
       intervalPhase: "HARD", // HARD | EASY
-      intervalLabel: "Hard / Moderate"
+      intervalRound: 1,
+      intervalTotalRounds: 5
     };
+    let timerInterval = null;
 
     function playBeep(freq = 880, duration = 0.18, count = 2) {
       try {
@@ -1199,20 +1236,24 @@
           const gain = ctx.createGain();
           osc.type = "sine";
           osc.frequency.value = freq;
-          gain.gain.setValueAtTime(0.15, ctx.currentTime + i * 0.24);
+          gain.gain.setValueAtTime(0.18, ctx.currentTime + i * 0.24);
           gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + i * 0.24 + duration);
           osc.connect(gain);
           gain.connect(ctx.destination);
           osc.start(ctx.currentTime + i * 0.24);
           osc.stop(ctx.currentTime + i * 0.24 + duration);
         }
-      } catch (e) {}
+      } catch (e) {
+        // Audio blocked or unavailable
+      }
     }
 
     function stopTimer() {
-      if (timerInterval) clearInterval(timerInterval);
-      timerInterval = null;
       timerState.running = false;
+      if (timerInterval) {
+        clearInterval(timerInterval);
+        timerInterval = null;
+      }
     }
 
     function startCountdownTimer(seconds) {
@@ -1229,23 +1270,23 @@
         if (timerState.secondsLeft <= 0) {
           timerState.secondsLeft = 0;
           stopTimer();
-          playBeep(980, 0.22, 3);
-          showToast("Timer Complete!");
+          playBeep(880, 0.2, 3);
         }
         updateTimerDOM();
       }, 1000);
     }
 
-    function startFinisherIntervalTimer(hardLabel = "30s HARD") {
+    function startFinisherIntervalTimer(labelHard = "30s HARD") {
       stopTimer();
       timerState.mode = "interval";
+      timerState.intervalPhase = "HARD";
       timerState.intervalRound = 1;
       timerState.intervalTotalRounds = 5;
-      timerState.intervalPhase = "HARD";
-      timerState.intervalLabel = hardLabel;
       timerState.secondsLeft = 30;
+      timerState.totalSeconds = 30;
+      timerState.labelHard = labelHard;
       timerState.running = true;
-      playBeep(880, 0.15, 1);
+      playBeep(740, 0.15, 1);
       updateTimerDOM();
 
       timerInterval = setInterval(() => {
@@ -1266,7 +1307,6 @@
               timerState.secondsLeft = 0;
               stopTimer();
               playBeep(1040, 0.25, 3);
-              showToast("5-Min Finisher Complete!");
             }
           }
         }
@@ -1288,36 +1328,44 @@
 
       disp.textContent = formatMMSS(timerState.secondsLeft);
       if (timerState.mode === "interval") {
-        const isHard = timerState.intervalPhase === "HARD";
-        disp.style.color = isHard ? "var(--warning)" : "var(--success)";
-        if (sub) {
-          sub.innerHTML = `<span class="badge ${isHard ? "badge-warning" : "badge-success"}">Round ${timerState.intervalRound}/${timerState.intervalTotalRounds} • ${isHard ? timerState.intervalLabel : "30s EASY"}</span>`;
+        if (timerState.secondsLeft === 0 && !timerState.running) {
+          sub.textContent = "5-Min Finisher Complete!";
+          sub.style.color = "var(--success)";
+        } else {
+          const phaseText = timerState.intervalPhase === "HARD" ? (timerState.labelHard || "30s HARD") : "30s EASY";
+          sub.textContent = `Round ${timerState.intervalRound}/5 • ${phaseText}`;
+          sub.style.color = timerState.intervalPhase === "HARD" ? "var(--warning)" : "var(--accent)";
         }
       } else {
-        disp.style.color = timerState.secondsLeft === 0 ? "var(--success)" : "var(--accent)";
-        if (sub) sub.textContent = timerState.running ? "Countdown running..." : "Ready";
+        sub.textContent = timerState.secondsLeft === 0 && !timerState.running ? "Rest Complete — Next Set!" : "Rest Timer";
+        sub.style.color = timerState.secondsLeft === 0 ? "var(--success)" : "var(--text-secondary)";
       }
+
       if (toggleBtn) {
-        toggleBtn.textContent = timerState.running ? "Pause" : "Resume";
+        toggleBtn.textContent = timerState.running ? "Pause" : "Start";
       }
     }
 
     /*************************************************************************
-     * 5. NAVIGATION & VIEW ROUTER
+     * 5. NAVIGATION & VIEW RENDERING
      *************************************************************************/
-    function setWeek(w) {
-      const clamped = Math.max(1, Math.min(12, w));
-      state.currentWeek = clamped;
+    function setWeek(newWeek) {
+      if (newWeek < 1 || newWeek > 12) return;
+      state.currentWeek = newWeek;
       saveState();
       render();
     }
 
-    function switchTab(tab) {
+    function switchTab(tabName) {
       stopTimer();
-      state.activeTab = tab;
-      state.view = tab;
-      state.selectedDayId = null;
-      state.selectedExerciseId = null;
+      state.activeTab = tabName;
+      if (tabName === "calendar") {
+        state.view = "calendar";
+        state.selectedDayId = null;
+        state.selectedExerciseId = null;
+      } else {
+        state.view = tabName;
+      }
       saveState();
       render();
       window.scrollTo({ top: 0, behavior: "instant" });
@@ -1329,34 +1377,17 @@
       if (!day) return;
       state.selectedDayId = dayId;
       state.selectedExerciseId = null;
-      if (day.type === "lift") {
-        state.view = "day";
-      } else if (day.type === "run" || day.type === "opt") {
-        state.view = "run";
-      } else {
-        state.view = "recovery";
-      }
+      if (day.type === "lift") state.view = "day";
+      else if (day.type === "run" || day.type === "opt") state.view = "run";
+      else state.view = "recovery";
       saveState();
       render();
       window.scrollTo({ top: 0, behavior: "instant" });
     }
 
-    function openLift(exId) {
+    function openLift(exerciseId) {
       stopTimer();
-      const found = getExerciseById(exId);
-      if (!found) return;
-      state.selectedDayId = found.day.id;
-      state.selectedExerciseId = exId;
-      // Set default timer preset based on exercise category
-      if (found.exercise.category === "compound") {
-        timerState = { ...timerState, mode: "countdown", secondsLeft: 120, totalSeconds: 120, running: false };
-      } else if (found.exercise.category === "plank") {
-        timerState = { ...timerState, mode: "countdown", secondsLeft: 60, totalSeconds: 60, running: false };
-      } else if (found.exercise.category === "finisher") {
-        timerState = { ...timerState, mode: "countdown", secondsLeft: 300, totalSeconds: 300, running: false };
-      } else {
-        timerState = { ...timerState, mode: "countdown", secondsLeft: 60, totalSeconds: 60, running: false };
-      }
+      state.selectedExerciseId = exerciseId;
       state.view = "lift";
       saveState();
       render();
@@ -1364,7 +1395,7 @@
     }
 
     function render() {
-      // Update Header
+      // Update Header Week Controls
       document.getElementById("headerWeekLabel").textContent = `Week ${state.currentWeek}`;
       document.getElementById("prevWeekBtn").disabled = state.currentWeek <= 1;
       document.getElementById("nextWeekBtn").disabled = state.currentWeek >= 12;
@@ -1373,7 +1404,7 @@
       document.querySelectorAll(".nav-tab").forEach(btn => {
         const t = btn.getAttribute("data-tab");
         const isActive = (state.activeTab === t) ||
-          (t === "calendar" && ["calendar", "day", "lift", "run", "recovery"].includes(state.view));
+          (t === "calendar" && ["calendar", "baseline", "day", "lift", "run", "recovery"].includes(state.view));
         btn.classList.toggle("active", isActive);
       });
 
@@ -1382,6 +1413,10 @@
         case "calendar":
           main.innerHTML = renderCalendarView();
           attachCalendarEvents();
+          break;
+        case "baseline":
+          main.innerHTML = renderBaselineView();
+          attachBaselineEvents();
           break;
         case "day":
           main.innerHTML = renderDayView();
@@ -1399,42 +1434,34 @@
           main.innerHTML = renderRecoveryView();
           attachRecoveryEvents();
           break;
-        case "body":
-          main.innerHTML = renderBodyView();
-          attachBodyEvents();
-          break;
         case "progress":
           main.innerHTML = renderProgressView();
           attachProgressEvents();
+          break;
+        case "body":
+          main.innerHTML = renderBodyView();
+          attachBodyEvents();
           break;
         case "data":
           main.innerHTML = renderDataView();
           attachDataEvents();
           break;
-        default:
-          state.view = "calendar";
-          main.innerHTML = renderCalendarView();
-          attachCalendarEvents();
       }
     }
 
-    /*************************************************************************
-     * 6. VIEW RENDERERS
-     *************************************************************************/
     function renderWeekScroller() {
-      let html = `<div class="week-pills" id="weekPills">`;
+      let pills = "";
       for (let w = 1; w <= 12; w++) {
-        const isDeload = [4, 8, 12].includes(w);
+        const phase = getPhaseForWeek(w);
         const status = getWeekCompletionStatus(w);
-        html += `
-          <button class="week-pill ${w === state.currentWeek ? "active" : ""} ${isDeload ? "deload" : ""}" data-week="${w}">
+        pills += `
+          <button class="week-pill ${w === state.currentWeek ? "active" : ""} ${phase.isDeload ? "deload" : ""}" data-week="${w}">
             <span class="week-pill-label">W${w}</span>
             <span class="week-pill-dot ${status}"></span>
           </button>
         `;
       }
-      html += `</div>`;
-      return html;
+      return `<div class="week-pills" id="weekPillsContainer">${pills}</div>`;
     }
 
     function renderDeloadBanner(week) {
@@ -1442,8 +1469,11 @@
       if (!phase.isDeload) return "";
       return `
         <div class="banner-deload">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2.2" style="flex-shrink:0; margin-top:2px;"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-          <div><strong>${phase.name}:</strong> ${phase.deloadBanner}</div>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2.2" style="flex-shrink:0; margin-top:2px;">
+            <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+            <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+          </svg>
+          <div><strong>${phase.name}:</strong> ${phase.deloadBanner.replace(/^Deload \/ .*?: /, "")}</div>
         </div>
       `;
     }
@@ -1452,45 +1482,74 @@
     function renderCalendarView() {
       const w = state.currentWeek;
       const phase = getPhaseForWeek(w);
+      const baselineRecorded = hasStartingBaseline();
+      const sb = state.startingBaseline || {};
+
+      // Prominent Day 1 Starting Measurements card at the top of Week 1
+      let week1BaselineCard = "";
+      if (w === 1) {
+        const summaryParts = [];
+        if (sb.weight) summaryParts.push(`${sb.weight} lbs`);
+        if (sb.bodyFat) summaryParts.push(`${sb.bodyFat}% BF`);
+        if (sb.waist) summaryParts.push(`${sb.waist}" waist`);
+        if (sb.arms) summaryParts.push(`${sb.arms}" arms`);
+
+        week1BaselineCard = `
+          <button class="day-card" id="openBaselineCardBtn" style="border-color:${baselineRecorded ? "rgba(16, 185, 129, 0.45)" : "rgba(56, 189, 248, 0.55)"}; background:${baselineRecorded ? "var(--bg-card)" : "rgba(56, 189, 248, 0.08)"};">
+            <div class="day-card-left">
+              <div class="day-icon-box" style="background:rgba(56, 189, 248, 0.18); color:var(--accent);">DAY 1</div>
+              <div style="min-width:0;">
+                <div class="day-title">
+                  <span>Starting Measurements</span>
+                </div>
+                <div class="day-sub">
+                  ${baselineRecorded
+                    ? (summaryParts.length ? summaryParts.join(" • ") : `Recorded ${sb.date || ""}`)
+                    : "Tap to record Day 1 weight & body measurements"}
+                </div>
+              </div>
+            </div>
+            <div style="display:flex; align-items:center; gap:6px; flex-shrink:0;">
+              ${baselineRecorded
+                ? `<span class="badge badge-success">Baseline Set</span>`
+                : `<span class="badge badge-accent">Start Here</span>`}
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" stroke-width="2.2"><polyline points="9 18 15 12 9 6"/></svg>
+            </div>
+          </button>
+        `;
+      }
 
       let daysHtml = PROGRAM.days.map(day => {
-        const comp = getDayCompletion(w, day);
-        const iconClass = day.type === "lift" ? "type-lift" : day.type === "run" ? "type-run" : day.type === "opt" ? "type-opt" : "type-rest";
-        let statusBadge = "";
-        if (day.type === "lift") {
-          statusBadge = comp.isComplete
-            ? `<span class="badge badge-success">${comp.done}/${comp.total} Done</span>`
-            : comp.hasAny
-              ? `<span class="badge badge-warning">${comp.done}/${comp.total} Lifts</span>`
-              : `<span class="badge badge-muted">0/${comp.total}</span>`;
+        const stats = getDayCompletionStats(w, day);
+        const typeClass = `type-${day.type}`;
+        let badgeHtml = "";
+        if (stats.isComplete) {
+          badgeHtml = `<span class="badge badge-success">Done</span>`;
+        } else if (stats.isStarted) {
+          badgeHtml = `<span class="badge badge-warning">${stats.completed}/${stats.total}</span>`;
         } else {
-          statusBadge = comp.isComplete
-            ? `<span class="badge badge-success">Logged</span>`
-            : `<span class="badge badge-muted">${day.typeLabel}</span>`;
+          badgeHtml = `<span class="badge badge-muted">${day.typeLabel}</span>`;
         }
 
-        // Check if any lift on this day has an overload alert
-        let overloadCount = 0;
-        if (day.exercises) {
-          day.exercises.forEach(ex => {
-            if (checkOverloadReady(w, ex)) overloadCount++;
-          });
-        }
+        const subText = day.type === "lift"
+          ? `${day.focus} • ${day.exercises.length} exercises`
+          : day.type === "run" || day.type === "opt"
+            ? `${day.plannedType} • ${day.targetDuration}`
+            : day.notes;
 
         return `
           <button class="day-card" data-day="${day.id}">
             <div class="day-card-left">
-              <div class="day-icon-box ${iconClass}">${day.shortName}</div>
+              <div class="day-icon-box ${typeClass}">${day.shortName}</div>
               <div style="min-width:0;">
                 <div class="day-title">
-                  <span>${day.dayName}: ${day.focus}</span>
+                  <span>${day.dayName}</span>
                 </div>
-                <div class="day-sub">${day.notes}</div>
-                ${overloadCount > 0 ? `<div style="margin-top:5px;"><span class="badge badge-success">+${overloadCount} Overload Ready</span></div>` : ""}
+                <div class="day-sub">${subText}</div>
               </div>
             </div>
             <div style="display:flex; align-items:center; gap:6px; flex-shrink:0;">
-              ${statusBadge}
+              ${badgeHtml}
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" stroke-width="2.2"><polyline points="9 18 15 12 9 6"/></svg>
             </div>
           </button>
@@ -1501,18 +1560,19 @@
         ${renderWeekScroller()}
         ${renderDeloadBanner(w)}
 
-        <div class="card" style="padding:14px 16px;">
+        <!-- Phase & Guidelines Accordion Card -->
+        <div class="card">
           <div class="phase-header" id="phaseToggle">
             <div>
-              <div style="font-size:11.5px; text-transform:uppercase; letter-spacing:0.04em; color:var(--accent); font-weight:700;">Current Training Block</div>
-              <div style="font-size:15px; font-weight:700; margin-top:2px;">${phase.name}</div>
+              <div style="font-size:12px; font-weight:700; color:var(--accent); text-transform:uppercase; letter-spacing:0.04em;">Current Training Phase</div>
+              <div style="font-size:16px; font-weight:700; margin-top:2px;">${phase.name}</div>
             </div>
-            <span class="badge badge-accent">${state.phaseExpanded ? "Hide Guide" : "Phase Guide"}</span>
+            <span class="badge badge-accent">${state.phaseExpanded ? "Hide Guide" : "Guide"}</span>
           </div>
           ${state.phaseExpanded ? `
             <div style="margin-top:12px; padding-top:12px; border-top:1px solid var(--border); font-size:13.5px; color:var(--text-secondary);">
-              <p style="margin:0 0 8px 0;"><strong style="color:var(--text-primary);">How to train:</strong> ${phase.train}</p>
-              <p style="margin:0 0 10px 0;"><strong style="color:var(--text-primary);">Weekly check-in:</strong> ${phase.checkin}</p>
+              <p style="margin:0 0 8px 0;"><strong style="color:var(--text-primary);">How to Train:</strong> ${phase.train}</p>
+              <p style="margin:0 0 10px 0;"><strong style="color:var(--text-primary);">Bodyweight Check-In:</strong> ${phase.checkin}</p>
               <div style="font-weight:700; color:var(--text-primary); margin-bottom:4px;">Session Guidelines:</div>
               <ul style="margin:0; padding-left:18px;">
                 ${PROGRAM.guidelines.map(g => `<li style="margin-bottom:4px;">${g}</li>`).join("")}
@@ -1524,6 +1584,7 @@
         <div style="margin: 14px 0 8px 2px; font-size:13px; font-weight:700; color:var(--text-secondary); text-transform:uppercase; letter-spacing:0.04em;">
           Week ${w} Schedule
         </div>
+        ${week1BaselineCard}
         ${daysHtml}
       `;
     }
@@ -1535,6 +1596,16 @@
       const activePill = document.querySelector(".week-pill.active");
       if (activePill) activePill.scrollIntoView({ behavior: "smooth", inline: "center", block: "nearest" });
 
+      const baselineBtn = document.getElementById("openBaselineCardBtn");
+      if (baselineBtn) {
+        baselineBtn.addEventListener("click", () => {
+          state.view = "baseline";
+          saveState();
+          render();
+          window.scrollTo({ top: 0, behavior: "instant" });
+        });
+      }
+
       const phaseToggle = document.getElementById("phaseToggle");
       if (phaseToggle) {
         phaseToggle.addEventListener("click", () => {
@@ -1544,8 +1615,145 @@
         });
       }
 
-      document.querySelectorAll(".day-card").forEach(card => {
+      document.querySelectorAll(".day-card[data-day]").forEach(card => {
         card.addEventListener("click", () => openDay(card.dataset.day));
+      });
+    }
+
+    /* 6A-2. STARTING MEASUREMENTS (DAY 1 BASELINE) VIEW */
+    function renderBaselineView() {
+      const sb = state.startingBaseline || {
+        date: new Date().toISOString().slice(0, 10),
+        weight: "",
+        bodyFat: "",
+        waist: "",
+        chest: "",
+        arms: "",
+        thighs: "",
+        notes: ""
+      };
+
+      return `
+        <div class="subview-nav">
+          <button class="btn-back" id="backFromBaselineBtn">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3"><polyline points="15 18 9 12 15 6"/></svg>
+            <span>Week 1 Schedule</span>
+          </button>
+          <span class="badge badge-accent">Day 1 • Baseline</span>
+        </div>
+
+        <div class="card" style="border-color:rgba(56, 189, 248, 0.4);">
+          <div style="font-size:12px; font-weight:700; color:var(--accent); text-transform:uppercase;">Before Week 1 Begins</div>
+          <h2 style="margin:4px 0 6px 0; font-size:21px;">Starting Measurements</h2>
+          <p style="margin:0 0 14px 0; font-size:13.5px; color:var(--text-secondary);">
+            Record your Day 1 starting weight and measurements (lbs & inches). All 12 weeks of progress deltas and charts will automatically compare against this baseline.
+          </p>
+
+          <div class="input-group" style="margin-bottom:12px;">
+            <label for="baseDate">Starting Date</label>
+            <input id="baseDate" type="date" value="${escapeAttr(sb.date || new Date().toISOString().slice(0, 10))}" />
+          </div>
+
+          <div class="stats-grid-2" style="margin-bottom:10px;">
+            <div class="input-group">
+              <label for="baseWeight">Starting Weight (lbs)</label>
+              <input id="baseWeight" type="number" inputmode="decimal" step="0.1" placeholder="180.0" value="${escapeAttr(sb.weight)}" />
+            </div>
+            <div class="input-group">
+              <label for="baseBodyFat">Body Fat (%)</label>
+              <input id="baseBodyFat" type="number" inputmode="decimal" step="0.1" placeholder="16.5" value="${escapeAttr(sb.bodyFat)}" />
+            </div>
+          </div>
+
+          <div class="stats-grid-2" style="margin-bottom:10px;">
+            <div class="input-group">
+              <label for="baseWaist">Waist (in)</label>
+              <input id="baseWaist" type="number" inputmode="decimal" step="0.1" placeholder="33.0" value="${escapeAttr(sb.waist)}" />
+            </div>
+            <div class="input-group">
+              <label for="baseChest">Chest (in)</label>
+              <input id="baseChest" type="number" inputmode="decimal" step="0.1" placeholder="41.0" value="${escapeAttr(sb.chest)}" />
+            </div>
+          </div>
+
+          <div class="stats-grid-2" style="margin-bottom:12px;">
+            <div class="input-group">
+              <label for="baseArms">Arms / Biceps (in)</label>
+              <input id="baseArms" type="number" inputmode="decimal" step="0.1" placeholder="14.5" value="${escapeAttr(sb.arms)}" />
+            </div>
+            <div class="input-group">
+              <label for="baseThighs">Thighs (in)</label>
+              <input id="baseThighs" type="number" inputmode="decimal" step="0.1" placeholder="23.5" value="${escapeAttr(sb.thighs)}" />
+            </div>
+          </div>
+
+          <div class="input-group" style="margin-bottom:16px;">
+            <label for="baseNotes">Starting Goals & Baseline Notes</label>
+            <textarea id="baseNotes" rows="3" placeholder="e.g., Morning fasted check-in; 12-week goal is +5 lbs lean mass and 8 strict pull-ups...">${escapeHtml(sb.notes || "")}</textarea>
+          </div>
+
+          <button type="button" class="btn-primary" id="saveBaselineBtn" style="margin-bottom:10px;">
+            Save Starting Baseline & Start Week 1
+          </button>
+
+          <button type="button" class="btn-secondary" id="skipBaselineBtn" style="width:100%; color:var(--text-secondary);">
+            Skip for Now (Go to Week 1 Schedule)
+          </button>
+        </div>
+      `;
+    }
+
+    function attachBaselineEvents() {
+      const ensureBaseline = () => {
+        if (!state.startingBaseline) {
+          state.startingBaseline = {
+            date: new Date().toISOString().slice(0, 10),
+            weight: "",
+            bodyFat: "",
+            waist: "",
+            chest: "",
+            arms: "",
+            thighs: "",
+            notes: ""
+          };
+        }
+        return state.startingBaseline;
+      };
+
+      const fields = [
+        ["baseDate", "date"],
+        ["baseWeight", "weight"],
+        ["baseBodyFat", "bodyFat"],
+        ["baseWaist", "waist"],
+        ["baseChest", "chest"],
+        ["baseArms", "arms"],
+        ["baseThighs", "thighs"],
+        ["baseNotes", "notes"]
+      ];
+
+      fields.forEach(([elId, prop]) => {
+        const el = document.getElementById(elId);
+        if (el) {
+          el.addEventListener("input", () => {
+            ensureBaseline()[prop] = el.value;
+            saveState();
+          });
+        }
+      });
+
+      const goToWeek1 = (toastMsg = null) => {
+        state.baselineDismissed = true;
+        state.currentWeek = 1;
+        state.view = "calendar";
+        saveState(toastMsg);
+        render();
+        window.scrollTo({ top: 0, behavior: "instant" });
+      };
+
+      document.getElementById("backFromBaselineBtn").addEventListener("click", () => goToWeek1());
+      document.getElementById("skipBaselineBtn").addEventListener("click", () => goToWeek1());
+      document.getElementById("saveBaselineBtn").addEventListener("click", () => {
+        goToWeek1("Day 1 baseline saved!");
       });
     }
 
@@ -2348,18 +2556,33 @@
         notes: ""
       };
 
-      // Find Week 1 baseline for delta comparison
-      const week1 = state.body["1"] || {};
+      // Compare against Day 1 Starting Baseline (or Week 1 if Day 1 wasn't entered)
+      const baseline = getBaselineMetrics();
+      const baseData = baseline.data || {};
       const formatDelta = (curr, base, unit) => {
         const c = parseFloat(curr);
         const b = parseFloat(base);
-        if (!c || !b || w === 1) return "—";
+        if (!c || !b || (baseline.label === "Week 1" && w === 1)) return "—";
         const diff = Math.round((c - b) * 10) / 10;
         return `${diff >= 0 ? "+" : ""}${diff} ${unit}`;
       };
 
       return `
         ${renderWeekScroller()}
+
+        <div class="card" style="padding:12px 14px; display:flex; justify-content:space-between; align-items:center; gap:10px;">
+          <div>
+            <div style="font-size:11.5px; font-weight:700; color:var(--accent); text-transform:uppercase;">Day 1 Starting Baseline</div>
+            <div style="font-size:13px; color:var(--text-secondary); margin-top:2px;">
+              ${hasStartingBaseline()
+                ? `${state.startingBaseline.weight ? state.startingBaseline.weight + " lbs" : ""}${state.startingBaseline.waist ? " • " + state.startingBaseline.waist + '" waist' : ""}${state.startingBaseline.bodyFat ? " • " + state.startingBaseline.bodyFat + "% BF" : ""}`
+                : "Not recorded yet"}
+            </div>
+          </div>
+          <button type="button" class="btn-secondary" id="editBaselineFromBodyBtn" style="padding:6px 12px; min-height:36px; font-size:12.5px; color:var(--accent);">
+            ${hasStartingBaseline() ? "Edit Day 1" : "Set Day 1"}
+          </button>
+        </div>
 
         <div class="card">
           <div style="font-size:12px; font-weight:700; color:var(--accent); text-transform:uppercase;">Week ${w} Check-In • lbs & inches</div>
@@ -2412,33 +2635,33 @@
           <button type="button" class="btn-primary" id="saveBodyBtn">Save Week ${w} Measurements</button>
         </div>
 
-        <!-- Change Since Week 1 Summary -->
+        <!-- Change Since Day 1 / Week 1 Summary -->
         <div class="card">
-          <div style="font-size:12.5px; font-weight:700; color:var(--text-secondary); text-transform:uppercase; margin-bottom:10px;">Change Since Week 1</div>
+          <div style="font-size:12.5px; font-weight:700; color:var(--text-secondary); text-transform:uppercase; margin-bottom:10px;">Change Since ${baseline.label}</div>
           <div class="stats-grid-3">
             <div class="stat-box">
               <div class="stat-label">Weight</div>
-              <div class="stat-value" style="font-size:15px;">${formatDelta(entry.weight, week1.weight, "lbs")}</div>
+              <div class="stat-value" style="font-size:15px;">${formatDelta(entry.weight, baseData.weight, "lbs")}</div>
             </div>
             <div class="stat-box">
               <div class="stat-label">Body Fat</div>
-              <div class="stat-value" style="font-size:15px;">${formatDelta(entry.bodyFat, week1.bodyFat, "%")}</div>
+              <div class="stat-value" style="font-size:15px;">${formatDelta(entry.bodyFat, baseData.bodyFat, "%")}</div>
             </div>
             <div class="stat-box">
               <div class="stat-label">Waist</div>
-              <div class="stat-value" style="font-size:15px;">${formatDelta(entry.waist, week1.waist, "in")}</div>
+              <div class="stat-value" style="font-size:15px;">${formatDelta(entry.waist, baseData.waist, "in")}</div>
             </div>
             <div class="stat-box">
               <div class="stat-label">Chest</div>
-              <div class="stat-value" style="font-size:15px;">${formatDelta(entry.chest, week1.chest, "in")}</div>
+              <div class="stat-value" style="font-size:15px;">${formatDelta(entry.chest, baseData.chest, "in")}</div>
             </div>
             <div class="stat-box">
               <div class="stat-label">Arms</div>
-              <div class="stat-value" style="font-size:15px;">${formatDelta(entry.arms, week1.arms, "in")}</div>
+              <div class="stat-value" style="font-size:15px;">${formatDelta(entry.arms, baseData.arms, "in")}</div>
             </div>
             <div class="stat-box">
               <div class="stat-label">Thighs</div>
-              <div class="stat-value" style="font-size:15px;">${formatDelta(entry.thighs, week1.thighs, "in")}</div>
+              <div class="stat-value" style="font-size:15px;">${formatDelta(entry.thighs, baseData.thighs, "in")}</div>
             </div>
           </div>
         </div>
@@ -2467,6 +2690,16 @@
         btn.addEventListener("click", () => setWeek(Number(btn.dataset.week)));
       });
 
+      const editBaseBtn = document.getElementById("editBaselineFromBodyBtn");
+      if (editBaseBtn) {
+        editBaseBtn.addEventListener("click", () => {
+          state.view = "baseline";
+          saveState();
+          render();
+          window.scrollTo({ top: 0, behavior: "instant" });
+        });
+      }
+
       const ensureBody = () => {
         if (!state.body[`${w}`]) {
           state.body[`${w}`] = { date: new Date().toISOString().slice(0, 10), weight: "", bodyFat: "", waist: "", chest: "", arms: "", thighs: "", notes: "" };
@@ -2474,7 +2707,7 @@
         return state.body[`${w}`];
       };
 
-      const fields = [
+      const fieldMap = [
         ["bodyDate", "date"],
         ["bodyWeight", "weight"],
         ["bodyFat", "bodyFat"],
@@ -2485,7 +2718,7 @@
         ["bodyNotes", "notes"]
       ];
 
-      fields.forEach(([elId, prop]) => {
+      fieldMap.forEach(([elId, prop]) => {
         const el = document.getElementById(elId);
         if (el) {
           el.addEventListener("input", () => {
@@ -2509,168 +2742,323 @@
       drawBodyChart();
     }
 
-    /* 6G. PROGRESS & ANALYTICS DASHBOARD */
-    function renderProgressView() {
-      const allEx = getAllExercises();
-      // Count completed sessions across 12 weeks
-      let liftSessionsDone = 0;
-      let runSessionsDone = 0;
-      let totalRunMiles = 0;
-      let totalVolumeAllWeeks = 0;
+    function drawBodyChart() {
+      const canvas = document.getElementById("bodyChartCanvas");
+      if (!canvas) return;
+      const metric = state.selectedBodyMetric || "weight";
+      const points = [];
 
-      for (let w = 1; w <= 12; w++) {
-        PROGRAM.days.forEach(d => {
-          const comp = getDayCompletion(w, d);
-          if (d.type === "lift" && comp.hasAny) liftSessionsDone++;
-          if ((d.type === "run" || d.type === "opt") && comp.hasAny) runSessionsDone++;
-        });
-        allEx.forEach(ex => {
-          const rec = state.lifts[`${w}_${ex.id}`];
-          if (rec) totalVolumeAllWeeks += calculateExerciseMetrics(ex, rec).volume;
-        });
-        ["tue", "thu", "sat"].forEach(dId => {
-          const r = state.runs[`${w}_${dId}`];
-          if (r && r.distance) totalRunMiles += parseFloat(r.distance) || 0;
-        });
+      if (hasStartingBaseline() && state.startingBaseline[metric] !== "" && state.startingBaseline[metric] !== undefined) {
+        const bVal = parseFloat(state.startingBaseline[metric]);
+        if (bVal && bVal > 0) points.push({ label: "Start", val: bVal });
       }
 
-      // Overload watchlist for current week
-      const overloadList = [];
-      allEx.forEach(ex => {
-        const alert = checkOverloadReady(state.currentWeek, ex);
-        if (alert) overloadList.push({ ex, alert });
+      for (let w = 1; w <= 12; w++) {
+        const val = parseFloat(state.body[`${w}`]?.[metric]);
+        if (val && val > 0) points.push({ label: `W${w}`, val });
+      }
+      drawLineChart(canvas, points, "#10b981");
+    }
+
+    /* 6G. PROGRESS ANALYTICS VIEW (VOLUME, e1RM, OVERLOAD ALERTS) */
+    function renderProgressView() {
+      const w = state.currentWeek;
+
+      // 1. Compute Weekly Volume Load across all 12 weeks
+      let currentWeekVol = 0;
+      let prevWeekVol = 0;
+      let totalRunMiles = 0;
+      let totalRunMins = 0;
+
+      PROGRAM.days.forEach(day => {
+        if (day.type === "lift") {
+          day.exercises.forEach(ex => {
+            currentWeekVol += calculateExerciseMetrics(ex, getLiftRecord(w, ex)).volume;
+            if (w > 1) prevWeekVol += calculateExerciseMetrics(ex, getLiftRecord(w - 1, ex)).volume;
+          });
+        } else if (day.type === "run" || day.type === "opt") {
+          const r = state.runs[`${w}_${day.id}`];
+          if (r) {
+            totalRunMiles += parseFloat(r.distance) || 0;
+            totalRunMins += parseFloat(r.duration) || 0;
+          }
+        }
       });
 
-      const selectedEx = getExerciseById(state.selectedChartLift)?.exercise || allEx[0];
+      let volTrendText = "No prior week data";
+      if (w > 1 && prevWeekVol > 0 && currentWeekVol > 0) {
+        const diff = currentWeekVol - prevWeekVol;
+        const pct = Math.round((diff / prevWeekVol) * 100);
+        volTrendText = `${diff >= 0 ? "+" : ""}${pct}% vs Week ${w - 1}`;
+      }
+
+      // 2. Scan for all Auto-Overload Ready Lifts in current week
+      const overloadList = [];
+      PROGRAM.days.forEach(day => {
+        if (day.type === "lift") {
+          day.exercises.forEach(ex => {
+            const ov = checkOverloadReady(w, ex);
+            if (ov) overloadList.push({ day, exercise: ex, overload: ov });
+          });
+        }
+      });
+
+      // 3. Gather all weighted & bodyweight exercises for e1RM / Volume selector
+      const allLifts = [];
+      PROGRAM.days.forEach(d => {
+        if (d.type === "lift") {
+          d.exercises.forEach(ex => {
+            if (ex.inputMode !== "timed") allLifts.push({ day: d, ex });
+          });
+        }
+      });
 
       return `
-        <h2 style="margin:4px 0 12px 2px; font-size:20px;">12-Week Progress & Analytics</h2>
+        ${renderWeekScroller()}
 
-        <!-- Summary KPIs -->
-        <div class="stats-grid-3" style="margin-bottom:12px;">
-          <div class="stat-box">
-            <div class="stat-label">Lift Sessions</div>
-            <div class="stat-value" style="color:var(--accent);">${liftSessionsDone}<span style="font-size:13px; color:var(--text-muted);">/36</span></div>
-          </div>
-          <div class="stat-box">
-            <div class="stat-label">Runs Logged</div>
-            <div class="stat-value" style="color:var(--success);">${runSessionsDone}<span style="font-size:13px; color:var(--text-muted);">/36</span></div>
-          </div>
-          <div class="stat-box">
-            <div class="stat-label">Total Miles</div>
-            <div class="stat-value">${Math.round(totalRunMiles * 10) / 10} <span style="font-size:12px;">mi</span></div>
+        <!-- Weekly Summary KPIs -->
+        <div class="card">
+          <div style="font-size:12px; font-weight:700; color:var(--accent); text-transform:uppercase;">Week ${w} Training Output</div>
+          <h2 style="margin:4px 0 12px 0; font-size:20px;">Progress & Overload Summary</h2>
+
+          <div class="stats-grid-2">
+            <div class="stat-box">
+              <div class="stat-label">Weekly Volume Load</div>
+              <div class="stat-value">${currentWeekVol.toLocaleString()} lbs</div>
+              <div class="stat-delta" style="color:var(--accent);">${volTrendText}</div>
+            </div>
+            <div class="stat-box">
+              <div class="stat-label">Weekly Cardio</div>
+              <div class="stat-value">${Math.round(totalRunMiles * 10) / 10} mi</div>
+              <div class="stat-delta" style="color:var(--success);">${Math.round(totalRunMins)} mins logged</div>
+            </div>
           </div>
         </div>
 
-        <!-- Auto Overload Ready Watchlist -->
+        <!-- Auto Overload Alerts Card -->
         <div class="card">
           <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-            <span style="font-size:13px; font-weight:700; color:var(--success); text-transform:uppercase;">Overload Ready (+2.5–5%)</span>
-            <span class="badge badge-success">Week ${state.currentWeek}</span>
+            <span style="font-size:13px; font-weight:700; color:var(--success); text-transform:uppercase;">Auto Overload Alerts (Week ${w})</span>
+            <span class="badge badge-success">${overloadList.length} Ready</span>
           </div>
           ${overloadList.length === 0 ? `
             <p style="margin:0; font-size:13.5px; color:var(--text-secondary);">
-              Hit the top of your target rep range on all sets of any exercise to trigger automatic +2.5–5% load recommendations here.
+              When all sets of a lift reach the top of their target rep range with clean form, they will automatically appear here with a +2.5–5% load recommendation.
             </p>
-          ` : overloadList.map(({ ex, alert }) => `
-            <div style="display:flex; justify-content:space-between; align-items:center; padding:10px 0; border-bottom:1px solid var(--border);">
-              <div>
-                <div style="font-weight:700; font-size:14.5px;">${ex.name}</div>
-                <div style="font-size:12.5px; color:var(--text-secondary);">
-                  ${alert.suggestedWeight ? `Current: ${alert.currentWeight} lbs → Try <strong>${alert.suggestedWeight} lbs</strong>` : `Hit ${ex.maxReps} reps on all sets!`}
-                </div>
+          ` : overloadList.map(item => `
+            <div style="padding:10px 12px; background:var(--success-dim); border:1px solid rgba(16,185,129,0.4); border-radius:12px; margin-bottom:8px;">
+              <div style="font-weight:700; font-size:14.5px; color:var(--text-primary);">${item.exercise.name} (${item.day.shortName})</div>
+              <div style="font-size:13px; color:#a7f3d0; margin-top:2px;">
+                Hit top reps (${item.exercise.target})!
+                ${item.overload.suggestedWeight ? ` Increase from ${item.overload.currentWeight} lbs → <strong>${item.overload.suggestedWeight} lbs</strong> next week.` : ` Add weight or harder progression next week.`}
               </div>
-              <button class="btn-secondary" data-jump-ex="${ex.id}" style="padding:6px 12px; min-height:36px; font-size:12.5px; color:var(--accent);">Open</button>
             </div>
           `).join("")}
         </div>
 
-        <!-- Weekly Total Volume Chart -->
-        <div class="card">
-          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-            <span style="font-size:13px; font-weight:700; color:var(--text-secondary); text-transform:uppercase;">Weekly Lifting Volume (lbs)</span>
-            <span style="font-size:12px; color:var(--accent); font-weight:700;">Total: ${totalVolumeAllWeeks.toLocaleString()} lbs</span>
-          </div>
-          <canvas id="weeklyVolumeCanvas" class="chart-canvas"></canvas>
-        </div>
-
-        <!-- Individual Lift e1RM & Top Weight Progression -->
+        <!-- Lift e1RM & Volume Progression Chart -->
         <div class="card">
           <div style="font-size:13px; font-weight:700; color:var(--text-secondary); text-transform:uppercase; margin-bottom:8px;">
-            Lift Progression (e1RM & Top Weight)
+            Estimated 1RM (e1RM) & Lift Progression
           </div>
-          <select id="liftProgressSelect" style="margin-bottom:12px;">
-            ${allEx.filter(e => e.inputMode !== "timed").map(e => `
-              <option value="${e.id}" ${e.id === selectedEx.id ? "selected" : ""}>${e.dayName}: ${e.name}</option>
+          <select id="chartLiftSelect" style="margin-bottom:12px;">
+            ${allLifts.map(item => `
+              <option value="${item.ex.id}" ${state.selectedChartLift === item.ex.id ? "selected" : ""}>
+                ${item.day.shortName}: ${item.ex.name}
+              </option>
             `).join("")}
           </select>
-          <canvas id="liftProgressCanvas" class="chart-canvas"></canvas>
-          <div style="display:flex; justify-content:center; gap:16px; margin-top:8px; font-size:12px; color:var(--text-secondary);">
-            <span><strong style="color:#38bdf8;">●</strong> Est. 1RM (lbs)</span>
-            <span><strong style="color:#10b981;">●</strong> Top Set Weight / Reps</span>
-          </div>
+          <canvas id="liftChartCanvas" class="chart-canvas"></canvas>
+          <div id="liftChartCaption" style="font-size:12.5px; color:var(--text-secondary); margin-top:8px; text-align:center;"></div>
         </div>
       `;
     }
 
     function attachProgressEvents() {
-      document.querySelectorAll("[data-jump-ex]").forEach(btn => {
-        btn.addEventListener("click", () => openLift(btn.dataset.jumpEx));
+      document.querySelectorAll(".week-pill").forEach(btn => {
+        btn.addEventListener("click", () => setWeek(Number(btn.dataset.week)));
       });
 
-      const sel = document.getElementById("liftProgressSelect");
+      const sel = document.getElementById("chartLiftSelect");
       if (sel) {
         sel.addEventListener("change", () => {
           state.selectedChartLift = sel.value;
           saveState();
-          drawLiftProgressChart();
+          drawLiftChart();
         });
       }
-
-      drawWeeklyVolumeChart();
-      drawLiftProgressChart();
+      drawLiftChart();
     }
 
-    /* 6H. DATA EXPORT & BACKUP VIEW (GOOGLE SHEETS CSV + JSON) */
+    function drawLiftChart() {
+      const canvas = document.getElementById("liftChartCanvas");
+      const caption = document.getElementById("liftChartCaption");
+      if (!canvas) return;
+      const found = getExerciseById(state.selectedChartLift);
+      if (!found) return;
+      const { exercise: ex } = found;
+
+      const points = [];
+      for (let w = 1; w <= 12; w++) {
+        const rec = getLiftRecord(w, ex);
+        const m = calculateExerciseMetrics(ex, rec);
+        const val = ex.inputMode === "weighted" ? m.bestE1RM : m.totalReps;
+        if (val > 0) points.push({ label: `W${w}`, val });
+      }
+
+      if (caption) {
+        caption.textContent = ex.inputMode === "weighted"
+          ? "Showing best Estimated 1-Rep Max (lbs) per week"
+          : "Showing total completed reps per week";
+      }
+      drawLineChart(canvas, points, "#38bdf8");
+    }
+
+    /* Responsive Canvas Line Chart Helper */
+    function drawLineChart(canvas, points, strokeColor) {
+      const dpr = window.devicePixelRatio || 1;
+      const rect = canvas.getBoundingClientRect();
+      const width = rect.width || 320;
+      const height = 210;
+      canvas.width = width * dpr;
+      canvas.height = height * dpr;
+
+      const ctx = canvas.getContext("2d");
+      ctx.scale(dpr, dpr);
+      ctx.clearRect(0, 0, width, height);
+
+      if (points.length === 0) {
+        ctx.fillStyle = "#64748b";
+        ctx.font = "13px -apple-system, sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillText("Log at least 1 week of data to view trend chart", width / 2, height / 2);
+        return;
+      }
+
+      const padLeft = 44, padRight = 18, padTop = 22, padBottom = 30;
+      const plotW = width - padLeft - padRight;
+      const plotH = height - padTop - padBottom;
+
+      const vals = points.map(p => p.val);
+      let minV = Math.min(...vals);
+      let maxV = Math.max(...vals);
+      if (minV === maxV) {
+        minV = Math.max(0, minV - 5);
+        maxV = maxV + 5;
+      } else {
+        const span = maxV - minV;
+        minV = Math.max(0, minV - span * 0.15);
+        maxV = maxV + span * 0.15;
+      }
+
+      // Grid lines
+      ctx.strokeStyle = "rgba(51, 65, 85, 0.6)";
+      ctx.lineWidth = 1;
+      ctx.fillStyle = "#94a3b8";
+      ctx.font = "11px -apple-system, sans-serif";
+      ctx.textAlign = "right";
+
+      for (let i = 0; i <= 3; i++) {
+        const y = padTop + (plotH * i) / 3;
+        const vLabel = Math.round((maxV - ((maxV - minV) * i) / 3) * 10) / 10;
+        ctx.beginPath();
+        ctx.moveTo(padLeft, y);
+        ctx.lineTo(width - padRight, y);
+        ctx.stroke();
+        ctx.fillText(vLabel, padLeft - 6, y + 4);
+      }
+
+      // Compute coordinates
+      const coords = points.map((pt, i) => {
+        const x = points.length === 1
+          ? padLeft + plotW / 2
+          : padLeft + (plotW * i) / (points.length - 1);
+        const y = padTop + plotH - ((pt.val - minV) / (maxV - minV)) * plotH;
+        return { x, y, label: pt.label, val: pt.val };
+      });
+
+      // Line
+      if (coords.length > 1) {
+        ctx.strokeStyle = strokeColor;
+        ctx.lineWidth = 3;
+        ctx.lineJoin = "round";
+        ctx.beginPath();
+        coords.forEach((c, idx) => {
+          if (idx === 0) ctx.moveTo(c.x, c.y);
+          else ctx.lineTo(c.x, c.y);
+        });
+        ctx.stroke();
+      }
+
+      // Points & Labels
+      coords.forEach(c => {
+        ctx.fillStyle = "#0f172a";
+        ctx.beginPath();
+        ctx.arc(c.x, c.y, 5.5, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.fillStyle = strokeColor;
+        ctx.beginPath();
+        ctx.arc(c.x, c.y, 4, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.fillStyle = "#f8fafc";
+        ctx.font = "bold 11px -apple-system, sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillText(c.val, c.x, c.y - 10);
+
+        ctx.fillStyle = "#94a3b8";
+        ctx.font = "11px -apple-system, sans-serif";
+        ctx.fillText(c.label, c.x, height - 8);
+      });
+    }
+
+    /* 6H. EXPORT / BACKUP / DATA MANAGEMENT VIEW */
     function renderDataView() {
       return `
-        <h2 style="margin:4px 0 12px 2px; font-size:20px;">Export & Backup</h2>
-
         <div class="card">
-          <div style="font-size:13px; font-weight:700; color:var(--accent); text-transform:uppercase; margin-bottom:4px;">Google Sheets Sync</div>
-          <h3 style="margin:0 0 8px 0; font-size:17px;">Export CSV for Google Sheets</h3>
+          <div style="font-size:12px; font-weight:700; color:var(--accent); text-transform:uppercase;">Google Sheets & iPhone Backup</div>
+          <h2 style="margin:4px 0 6px 0; font-size:20px;">Export & Backup Your Data</h2>
           <p style="margin:0 0 14px 0; font-size:13.5px; color:var(--text-secondary);">
-            Downloads CSV files formatted to match your original 12-Week Weight Training spreadsheet columns so you can import or archive them directly in Google Drive.
+            All workouts save automatically on your iPhone. Export CSV files to import back into your Google Sheet, or download a JSON backup once a week to keep your history safe.
           </p>
-          <div style="display:flex; flex-direction:column; gap:10px;">
-            <button type="button" class="btn-primary" id="exportLiftsCsvBtn">Download Weight Training Log (.csv)</button>
-            <button type="button" class="btn-secondary" id="exportRunsCsvBtn">Download Running Log (.csv)</button>
-            <button type="button" class="btn-secondary" id="exportBodyCsvBtn">Download Body Measurements (.csv)</button>
-          </div>
+
+          <button type="button" class="btn-primary" id="exportLiftsCsvBtn" style="margin-bottom:10px;">
+            Export Lifts CSV (Google Sheets Format)
+          </button>
+
+          <button type="button" class="btn-secondary" id="exportRunsCsvBtn" style="width:100%; margin-bottom:10px;">
+            Export Running Log CSV
+          </button>
+
+          <button type="button" class="btn-secondary" id="exportBodyCsvBtn" style="width:100%; margin-bottom:10px;">
+            Export Body Measurements CSV
+          </button>
         </div>
 
         <div class="card">
-          <div style="font-size:13px; font-weight:700; color:var(--success); text-transform:uppercase; margin-bottom:4px;">iOS Safari Data Safety</div>
-          <h3 style="margin:0 0 8px 0; font-size:17px;">Full JSON Backup & Restore</h3>
-          <p style="margin:0 0 14px 0; font-size:13.5px; color:var(--text-secondary);">
-            Save a complete backup file to your iPhone Files / iCloud Drive, or restore from a previous backup.
-          </p>
-          <div style="display:flex; flex-direction:column; gap:10px;">
-            <button type="button" class="btn-secondary" id="exportJsonBtn" style="color:var(--success); border-color:rgba(16,185,129,0.45);">Download Full Backup (.json)</button>
-            <label class="btn-secondary" style="cursor:pointer;">
-              <span>Restore from Backup (.json)</span>
-              <input type="file" id="importJsonInput" accept=".json,application/json" style="display:none;" />
-            </label>
+          <div style="font-size:13px; font-weight:700; color:var(--text-secondary); text-transform:uppercase; margin-bottom:10px;">
+            Full App Backup & Restore (JSON)
           </div>
+          <button type="button" class="btn-secondary" id="downloadJsonBtn" style="width:100%; margin-bottom:10px; color:var(--accent);">
+            Download JSON Backup File
+          </button>
+
+          <label class="btn-secondary" style="width:100%; cursor:pointer; display:flex;">
+            <span>Restore from JSON Backup File</span>
+            <input type="file" id="importJsonInput" accept=".json,application/json" style="display:none;" />
+          </label>
         </div>
 
         <div class="card" style="border-color:rgba(239,68,68,0.35);">
-          <h3 style="margin:0 0 8px 0; font-size:16px; color:#fca5a5;">Reset Data</h3>
+          <div style="font-size:13px; font-weight:700; color:var(--danger); text-transform:uppercase; margin-bottom:8px;">
+            Reset Program
+          </div>
           <p style="margin:0 0 12px 0; font-size:13px; color:var(--text-secondary);">
-            Clear all logged lifts, runs, and body measurements from this device.
+            Clear all logged sets, runs, and body measurements to start a fresh 12-week cycle.
           </p>
-          <button type="button" class="btn-secondary" id="resetAllBtn" style="width:100%; color:#f87171; border-color:rgba(239,68,68,0.45);">
-            Reset All App Data
+          <button type="button" class="btn-secondary" id="resetAllBtn" style="width:100%; color:var(--danger); border-color:rgba(239,68,68,0.45);">
+            Reset All 12-Week Data
           </button>
         </div>
       `;
@@ -2680,7 +3068,7 @@
       document.getElementById("exportLiftsCsvBtn").addEventListener("click", exportLiftsCSV);
       document.getElementById("exportRunsCsvBtn").addEventListener("click", exportRunsCSV);
       document.getElementById("exportBodyCsvBtn").addEventListener("click", exportBodyCSV);
-      document.getElementById("exportJsonBtn").addEventListener("click", exportFullJSON);
+      document.getElementById("downloadJsonBtn").addEventListener("click", downloadJSONBackup);
 
       document.getElementById("importJsonInput").addEventListener("change", e => {
         const file = e.target.files[0];
@@ -2689,195 +3077,39 @@
         reader.onload = ev => {
           try {
             const parsed = JSON.parse(ev.target.result);
-            if (!parsed || typeof parsed !== "object" || !parsed.lifts) {
-              throw new Error("Invalid backup file");
-            }
+            if (!parsed || typeof parsed !== "object") throw new Error("Invalid file");
             state = { ...createEmptyState(), ...parsed };
             saveState("Backup restored!");
             render();
           } catch (err) {
-            showToast("Invalid JSON backup file.");
+            showToast("Invalid JSON backup file");
           }
         };
         reader.readAsText(file);
       });
 
       document.getElementById("resetAllBtn").addEventListener("click", () => {
-        openConfirmModal(
-          "Reset All Data?",
-          "This will permanently erase all 12 weeks of logged lifts, runs, recovery notes, and body measurements on this device. Make sure you download a backup first.",
+        showConfirmModal(
+          "Reset All 12-Week Data?",
+          "This will permanently erase all logged lifts, runs, and body measurements on this device. Download a JSON backup first if you want to keep your history.",
           () => {
             state = createEmptyState();
-            saveState("All data cleared.");
+            saveState("All data cleared");
             switchTab("calendar");
           }
         );
       });
     }
 
-    /*************************************************************************
-     * 7. RESPONSIVE HTML5 CANVAS CHARTS
-     *************************************************************************/
-    function setupCanvas(canvasId) {
-      const canvas = document.getElementById(canvasId);
-      if (!canvas) return null;
-      const dpr = window.devicePixelRatio || 1;
-      const rect = canvas.getBoundingClientRect();
-      const width = rect.width || 340;
-      const height = 210;
-      canvas.width = width * dpr;
-      canvas.height = height * dpr;
-      const ctx = canvas.getContext("2d");
-      ctx.scale(dpr, dpr);
-      return { ctx, width, height };
+    function csvEscape(val) {
+      if (val === null || val === undefined) return "";
+      const str = String(val);
+      if (str.includes(",") || str.includes('"') || str.includes("\n")) {
+        return `"${str.replace(/"/g, '""')}"`;
+      }
+      return str;
     }
 
-    function drawLineChart(canvasId, seriesList, unitSuffix = "") {
-      const setup = setupCanvas(canvasId);
-      if (!setup) return;
-      const { ctx, width, height } = setup;
-
-      const pad = { top: 20, right: 16, bottom: 28, left: 46 };
-      const plotW = width - pad.left - pad.right;
-      const plotH = height - pad.top - pad.bottom;
-
-      ctx.clearRect(0, 0, width, height);
-
-      // Collect all numeric points
-      const allVals = [];
-      seriesList.forEach(s => s.data.forEach(v => { if (v !== null && !isNaN(v)) allVals.push(v); }));
-
-      // Draw horizontal gridlines & Week 1-12 X labels
-      ctx.strokeStyle = "#334155";
-      ctx.lineWidth = 1;
-      ctx.fillStyle = "#94a3b8";
-      ctx.font = "11px -apple-system, sans-serif";
-      ctx.textAlign = "center";
-
-      for (let w = 1; w <= 12; w++) {
-        const x = pad.left + ((w - 1) / 11) * plotW;
-        ctx.fillText(`W${w}`, x, height - 8);
-      }
-
-      if (allVals.length === 0) {
-        ctx.fillStyle = "#64748b";
-        ctx.font = "13px -apple-system, sans-serif";
-        ctx.fillText("Log workouts across weeks to view trend chart", width / 2, height / 2);
-        return;
-      }
-
-      let minVal = Math.min(...allVals);
-      let maxVal = Math.max(...allVals);
-      if (minVal === maxVal) {
-        minVal = Math.max(0, minVal * 0.9);
-        maxVal = maxVal * 1.1 || 10;
-      } else {
-        const margin = (maxVal - minVal) * 0.15;
-        minVal = Math.max(0, minVal - margin);
-        maxVal = maxVal + margin;
-      }
-
-      ctx.textAlign = "right";
-      for (let i = 0; i <= 3; i++) {
-        const ratio = i / 3;
-        const y = pad.top + plotH - ratio * plotH;
-        const val = minVal + ratio * (maxVal - minVal);
-        ctx.beginPath();
-        ctx.moveTo(pad.left, y);
-        ctx.lineTo(width - pad.right, y);
-        ctx.stroke();
-        ctx.fillText(`${Math.round(val * 10) / 10}`, pad.left - 6, y + 4);
-      }
-
-      // Draw each series
-      seriesList.forEach(s => {
-        ctx.strokeStyle = s.color;
-        ctx.fillStyle = s.color;
-        ctx.lineWidth = 2.5;
-        ctx.beginPath();
-        let started = false;
-        const pts = [];
-
-        s.data.forEach((val, idx) => {
-          if (val === null || isNaN(val)) return;
-          const x = pad.left + (idx / 11) * plotW;
-          const y = pad.top + plotH - ((val - minVal) / (maxVal - minVal)) * plotH;
-          pts.push({ x, y, val });
-          if (!started) {
-            ctx.moveTo(x, y);
-            started = true;
-          } else {
-            ctx.lineTo(x, y);
-          }
-        });
-        ctx.stroke();
-
-        pts.forEach(p => {
-          ctx.beginPath();
-          ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
-          ctx.fill();
-        });
-      });
-    }
-
-    function drawWeeklyVolumeChart() {
-      const allEx = getAllExercises();
-      const weeklyVols = [];
-      for (let w = 1; w <= 12; w++) {
-        let sum = 0;
-        allEx.forEach(ex => {
-          const rec = state.lifts[`${w}_${ex.id}`];
-          if (rec) sum += calculateExerciseMetrics(ex, rec).volume;
-        });
-        weeklyVols.push(sum > 0 ? sum : null);
-      }
-      drawLineChart("weeklyVolumeCanvas", [{ color: "#38bdf8", data: weeklyVols }]);
-    }
-
-    function drawLiftProgressChart() {
-      const found = getExerciseById(state.selectedChartLift);
-      if (!found) return;
-      const ex = found.exercise;
-      const e1rmSeries = [];
-      const topSeries = [];
-
-      for (let w = 1; w <= 12; w++) {
-        const rec = state.lifts[`${w}_${ex.id}`];
-        if (!rec) {
-          e1rmSeries.push(null);
-          topSeries.push(null);
-          continue;
-        }
-        const m = calculateExerciseMetrics(ex, rec);
-        if (ex.inputMode === "weighted") {
-          e1rmSeries.push(m.bestE1RM > 0 ? m.bestE1RM : null);
-          topSeries.push(m.topWeight > 0 ? m.topWeight : null);
-        } else {
-          e1rmSeries.push(null);
-          topSeries.push(m.totalReps > 0 ? m.totalReps : null);
-        }
-      }
-
-      drawLineChart("liftProgressCanvas", [
-        { color: "#38bdf8", data: e1rmSeries },
-        { color: "#10b981", data: topSeries }
-      ]);
-    }
-
-    function drawBodyChart() {
-      const metric = state.selectedBodyMetric || "weight";
-      const vals = [];
-      for (let w = 1; w <= 12; w++) {
-        const b = state.body[`${w}`];
-        const v = b && b[metric] !== "" ? parseFloat(b[metric]) : null;
-        vals.push(v && !isNaN(v) ? v : null);
-      }
-      drawLineChart("bodyChartCanvas", [{ color: "#38bdf8", data: vals }]);
-    }
-
-    /*************************************************************************
-     * 8. CSV & JSON EXPORT HELPERS
-     *************************************************************************/
     function triggerDownload(filename, content, mimeType) {
       const blob = new Blob([content], { type: mimeType });
       const url = URL.createObjectURL(blob);
@@ -2887,15 +3119,8 @@
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
-    }
-
-    function csvEscape(val) {
-      const str = val === null || val === undefined ? "" : String(val);
-      if (str.includes(",") || str.includes('"') || str.includes("\n")) {
-        return `"${str.replace(/"/g, '""')}"`;
-      }
-      return str;
+      URL.revokeObjectURL(url);
+      showToast(`Exported ${filename}`);
     }
 
     function exportLiftsCSV() {
@@ -2903,7 +3128,7 @@
         "Day", "Week", "Exercise", "Sets", "Target reps / time",
         "Set 1 wt", "Set 1 reps", "Set 2 wt", "Set 2 reps",
         "Set 3 wt", "Set 3 reps", "Set 4 wt", "Set 4 reps",
-        "Volume Load (lbs)", "Est 1RM (lbs)", "Notes"
+        "Volume Load (lbs)", "Best e1RM (lbs)", "Notes"
       ];
       const rows = [headers.join(",")];
 
@@ -2911,43 +3136,44 @@
         for (let w = 1; w <= 12; w++) {
           day.exercises.forEach(ex => {
             const rec = getLiftRecord(w, ex);
-            const metrics = calculateExerciseMetrics(ex, rec);
-            const s = rec.sets;
-            const row = [
+            const m = calculateExerciseMetrics(ex, rec);
+            const s1 = rec.sets[0] || {};
+            const s2 = rec.sets[1] || {};
+            const s3 = rec.sets[2] || {};
+            const s4 = rec.sets[3] || {};
+            const modeTag = ex.inputMode === "bodyweight" && rec.bwMode !== "bw" ? `[${rec.bwMode}] ` : "";
+            rows.push([
               day.dayName,
-              w,
+              `Week ${w}`,
               ex.name,
               ex.sets,
               ex.target,
-              s[0]?.weight ?? "", s[0]?.reps ?? "",
-              s[1]?.weight ?? "", s[1]?.reps ?? "",
-              s[2]?.weight ?? "", s[2]?.reps ?? "",
-              s[3]?.weight ?? "", s[3]?.reps ?? "",
-              metrics.volume || "",
-              metrics.bestE1RM || "",
-              rec.notes || ""
-            ].map(csvEscape);
-            rows.push(row.join(","));
+              s1.weight || "", s1.reps || "",
+              s2.weight || "", s2.reps || "",
+              s3.weight || "", s3.reps || "",
+              s4.weight || "", s4.reps || "",
+              m.volume || "",
+              m.bestE1RM || "",
+              `${modeTag}${rec.notes || ""}`.trim()
+            ].map(csvEscape).join(","));
           });
         }
       });
 
-      triggerDownload("12_Week_Weight_Training_Lifts.csv", rows.join("\n"), "text/csv;charset=utf-8;");
-      showToast("Lifts CSV downloaded!");
+      triggerDownload("12_Week_Lifts_Log.csv", rows.join("\n"), "text/csv;charset=utf-8;");
     }
 
     function exportRunsCSV() {
-      const headers = ["Week", "Day", "Planned Type", "Date", "Duration (min)", "Distance (mi)", "Pace", "Effort (1-10)", "Notes"];
+      const headers = ["Week", "Day", "Planned session", "Date", "Duration (min)", "Distance (mi)", "Pace", "Effort (1-10)", "Notes"];
       const rows = [headers.join(",")];
 
       for (let w = 1; w <= 12; w++) {
-        ["tue", "thu", "sat"].forEach(dId => {
-          const day = getDayById(dId);
-          const r = state.runs[`${w}_${dId}`] || {};
+        PROGRAM.days.filter(d => d.type === "run" || d.type === "opt").forEach(day => {
+          const r = state.runs[`${w}_${day.id}`] || {};
           rows.push([
-            w,
+            `Week ${w}`,
             day.dayName,
-            day.plannedType,
+            `${day.plannedType} (${day.targetDuration})`,
             r.date || "",
             r.duration || "",
             r.distance || "",
@@ -2959,17 +3185,31 @@
       }
 
       triggerDownload("12_Week_Running_Log.csv", rows.join("\n"), "text/csv;charset=utf-8;");
-      showToast("Running CSV downloaded!");
     }
 
     function exportBodyCSV() {
       const headers = ["Week", "Date", "Body Weight (lbs)", "Body Fat (%)", "Waist (in)", "Chest (in)", "Arms (in)", "Thighs (in)", "Notes"];
       const rows = [headers.join(",")];
 
+      if (hasStartingBaseline()) {
+        const sb = state.startingBaseline;
+        rows.push([
+          "Day 1 Baseline",
+          sb.date || "",
+          sb.weight || "",
+          sb.bodyFat || "",
+          sb.waist || "",
+          sb.chest || "",
+          sb.arms || "",
+          sb.thighs || "",
+          sb.notes || ""
+        ].map(csvEscape).join(","));
+      }
+
       for (let w = 1; w <= 12; w++) {
         const b = state.body[`${w}`] || {};
         rows.push([
-          w,
+          `Week ${w}`,
           b.date || "",
           b.weight || "",
           b.bodyFat || "",
@@ -2982,34 +3222,19 @@
       }
 
       triggerDownload("12_Week_Body_Measurements.csv", rows.join("\n"), "text/csv;charset=utf-8;");
-      showToast("Measurements CSV downloaded!");
     }
 
-    function exportFullJSON() {
+    function downloadJSONBackup() {
       const payload = JSON.stringify(state, null, 2);
-      triggerDownload(`12_Week_Strength_Backup_${new Date().toISOString().slice(0,10)}.json`, payload, "application/json");
-      showToast("Full JSON backup saved!");
+      const stamp = new Date().toISOString().slice(0, 10);
+      triggerDownload(`Workout_Tracker_Backup_${stamp}.json`, payload, "application/json");
     }
 
     /*************************************************************************
-     * 9. MODAL & SANITIZATION HELPERS
+     * 7. SECURITY & INITIALIZATION
      *************************************************************************/
-    let pendingModalAction = null;
-
-    function openConfirmModal(title, message, onConfirm) {
-      document.getElementById("modalTitle").textContent = title;
-      document.getElementById("modalMessage").textContent = message;
-      pendingModalAction = onConfirm;
-      document.getElementById("confirmModal").classList.remove("hidden");
-    }
-
-    function closeConfirmModal() {
-      document.getElementById("confirmModal").classList.add("hidden");
-      pendingModalAction = null;
-    }
-
     function escapeHtml(str) {
-      return String(str || "")
+      return String(str)
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;")
@@ -3017,35 +3242,25 @@
     }
 
     function escapeAttr(str) {
-      return escapeHtml(str);
+      if (str === null || str === undefined) return "";
+      return String(str).replace(/"/g, "&quot;");
     }
 
-    /*************************************************************************
-     * 10. INITIALIZATION
-     *************************************************************************/
-    document.getElementById("prevWeekBtn").addEventListener("click", () => setWeek(state.currentWeek - 1));
-    document.getElementById("nextWeekBtn").addEventListener("click", () => setWeek(state.currentWeek + 1));
-
-    document.querySelectorAll(".nav-tab").forEach(btn => {
-      btn.addEventListener("click", () => switchTab(btn.dataset.tab));
-    });
-
-    document.getElementById("modalCancelBtn").addEventListener("click", closeConfirmModal);
-    document.getElementById("modalConfirmBtn").addEventListener("click", () => {
-      if (pendingModalAction) pendingModalAction();
-      closeConfirmModal();
-    });
-
     window.addEventListener("resize", () => {
+      if (state.view === "progress") drawLiftChart();
       if (state.view === "body") drawBodyChart();
-      if (state.view === "progress") {
-        drawWeeklyVolumeChart();
-        drawLiftProgressChart();
-      }
     });
 
-    // Initial render
-    render();
+    window.onload = function () {
+      document.getElementById("prevWeekBtn").addEventListener("click", () => setWeek(state.currentWeek - 1));
+      document.getElementById("nextWeekBtn").addEventListener("click", () => setWeek(state.currentWeek + 1));
+
+      document.querySelectorAll(".nav-tab").forEach(btn => {
+        btn.addEventListener("click", () => switchTab(btn.getAttribute("data-tab")));
+      });
+
+      render();
+    };
   </script>
 </body>
 </html>
